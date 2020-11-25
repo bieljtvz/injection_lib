@@ -7,12 +7,15 @@ namespace injection
 	DWORD get_thread_id(DWORD PID);
 	HANDLE WINAPI thread_ldr(PTHREAD_DATA data);
 	DWORD WINAPI stub_ldr();
+
 	bool Inject_LoadLibrary_CreateRemoteThread(DWORD PID, const char* dll_path);
 	bool Inject_LoadLibrary_NtCreateThreadEx(DWORD PID, const char* dll_path);
 	bool Inject_LoadLibrary_RtlCreateUserThread(DWORD PID, const char* dll_path);
-	bool Inject_LdrLoadDll_NtCreateThreadEx(DWORD PID, const char* dll_path);
-	bool Inject_Ldr_RtlCreateUserThread(DWORD PID, const char* dll_path);
 	bool Inject_LoadLibrary_ThreadHijackX86(DWORD PID, const char* dll_path);
+
+	bool Inject_LdrLoadDll_NtCreateThreadEx(DWORD PID, const char* dll_path);
+	bool Inject_LdrLoadDll_RtlCreateUserThread(DWORD PID, const char* dll_path);
+	bool Inject_LdrLoadDll_CreateRemoteThread(DWORD PID, const char* dll_path);
 };
 
 DWORD injection::get_thread_id(DWORD PID)
@@ -172,6 +175,97 @@ bool injection::Inject_LoadLibrary_RtlCreateUserThread(DWORD PID, const char* dl
 	return 1;
 }
 
+bool injection::Inject_LoadLibrary_ThreadHijackX86(DWORD PID, const char* dll_path)
+{
+	char shell[] =
+	{
+		0x60,									//pushad
+		0xE8, 0x00, 0x00, 0x00, 0x00,			//call start
+		0x5B,									//pop ebx
+		0x81, 0xEB, 0x06, 0x00, 0x00, 0x00,		//sub ebx,start
+		0xB8, 0xCC, 0xCC, 0xCC, 0xCC,			//mov eax,0xCCCCCCCC
+		0x8D, 0x93, 0x22, 0x00, 0x00, 0x00,		//lea edx,[data+ebx]
+		0x52,									//push edx
+		0xFF, 0xD0,								//call eax
+		0x61,									//popad
+		0x68, 0xCC, 0xCC, 0xCC, 0xCC,			//push 0xCCCCCCCC
+		0xC3									//ret
+	};
+
+	DWORD THREAD_ID = injection::get_thread_id(PID);
+
+	HANDLE hProcess = OpenProcess(GENERIC_ALL, NULL, PID);
+	if (hProcess == INVALID_HANDLE_VALUE)
+	{
+		printf("[-] Falha ao abrir processo: %X\n", GetLastError());
+		CloseHandle(hProcess);
+		return 0;
+	}
+
+	HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, THREAD_ID);
+	if (hThread == INVALID_HANDLE_VALUE)
+	{
+		printf("[-] Falha ao abrir thread: %X\n", GetLastError());
+		CloseHandle(hThread);
+		return 0;
+	}
+
+	LPVOID mem = VirtualAllocEx(hProcess, NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
+	SuspendThread(hThread);
+
+	CONTEXT ctx;
+	ctx.ContextFlags = CONTEXT_FULL;
+	GetThreadContext(hThread, &ctx);
+
+	LPVOID buffer = VirtualAlloc(NULL, 65536, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+	LPBYTE ptr;
+	ptr = (LPBYTE)buffer;
+
+	memcpy(buffer, shell, sizeof(shell));
+
+	while (1)
+	{
+		if (*ptr == 0xb8 && *(PDWORD)(ptr + 1) == 0xCCCCCCCC)
+		{
+			*(PDWORD)(ptr + 1) = (DWORD)LoadLibraryA;
+		}
+		if (*ptr == 0x68 && *(PDWORD)(ptr + 1) == 0xCCCCCCCC)
+		{
+			*(PDWORD)(ptr + 1) = ctx.Eip;
+		}
+		if (*ptr == 0xC3)
+		{
+			ptr++;
+			break;
+		}
+		ptr++;
+
+
+	}
+
+
+	strcpy((char*)ptr, dll_path);
+
+	WriteProcessMemory(hProcess, mem, buffer, sizeof(shell) + strlen((char*)ptr), NULL);
+
+	ctx.Eip = (DWORD)mem;
+
+	SetThreadContext(hThread, &ctx);
+
+	ResumeThread(hThread);
+
+	VirtualFree(buffer, 0, MEM_RELEASE);
+
+	CloseHandle(hThread);
+	CloseHandle(hProcess);
+
+	printf("[+] Dll injetada com sucesso: \n");
+
+	return 1;
+}
+
 bool injection::Inject_LdrLoadDll_NtCreateThreadEx(DWORD PID, const char* dll_path)
 {
 	
@@ -248,7 +342,7 @@ bool injection::Inject_LdrLoadDll_NtCreateThreadEx(DWORD PID, const char* dll_pa
 	return 1;
 }
 
-bool injection::Inject_Ldr_RtlCreateUserThread(DWORD PID, const char* dll_path)
+bool injection::Inject_LdrLoadDll_RtlCreateUserThread(DWORD PID, const char* dll_path)
 {
 	LPVOID RtlCreateUserThread_Addr = (LPVOID)GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlCreateUserThread");
 	LPVOID LdrLoadDll_Addr = (LPVOID)GetProcAddress(GetModuleHandleA("ntdll.dll"), "LdrLoadDll");
@@ -305,16 +399,10 @@ bool injection::Inject_Ldr_RtlCreateUserThread(DWORD PID, const char* dll_path)
 
 }
 
-bool injection::Inject_LoadLibrary_ThreadHijackX86(DWORD PID, const char* dll_path)
+bool injection::Inject_LdrLoadDll_CreateRemoteThread(DWORD PID, const char* dll_path)
 {
-	char code[] =
-	{
-		0x60, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x5B, 0x81, 0xEB, 0x06, 0x00, 0x00,
-		0x00, 0xB8, 0xCC, 0xCC, 0xCC, 0xCC, 0x8D, 0x93, 0x22, 0x00, 0x00, 0x00,
-		0x52, 0xFF, 0xD0, 0x61, 0x68, 0xCC, 0xCC, 0xCC, 0xCC, 0xC3
-	};
-
-	DWORD THREAD_ID = injection::get_thread_id(PID);	
+	LPVOID LdrLoadDll_Addr = (LPVOID)GetProcAddress(GetModuleHandleA("ntdll.dll"), "LdrLoadDll");
+	LPVOID RtlInitUnicodeString_Addr = (LPVOID)GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlInitUnicodeString");
 
 	HANDLE hProcess = OpenProcess(GENERIC_ALL, NULL, PID);
 	if (hProcess == INVALID_HANDLE_VALUE)
@@ -324,64 +412,42 @@ bool injection::Inject_LoadLibrary_ThreadHijackX86(DWORD PID, const char* dll_pa
 		return 0;
 	}
 
-	HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, THREAD_ID);
-	if (hThread == INVALID_HANDLE_VALUE)
-	{
-		printf("[-] Falha ao abrir thread: %X\n", GetLastError());
-		CloseHandle(hThread);
+	///////Init////////	
+
+	size_t len = strlen(dll_path) + 1;
+	size_t converted = 0;
+	wchar_t* copy_wc_path;
+	copy_wc_path = (wchar_t*)malloc(len * sizeof(wchar_t));
+	mbstowcs_s(&converted, copy_wc_path, len, dll_path, _TRUNCATE);
+
+	THREAD_DATA data;
+	data.fnRtlInitUnicodeString = (pRtlInitUnicodeString)RtlInitUnicodeString_Addr;
+	data.fnLdrLoadDll = (pLdrLoadDll)LdrLoadDll_Addr;
+	memcpy(data.DllName, copy_wc_path, (wcslen(copy_wc_path) + 1) * sizeof(WCHAR));
+	data.DllPath = NULL;
+	data.Flags = 0;
+	data.ModuleHandle = INVALID_HANDLE_VALUE;
+
+	LPVOID pThreadData = VirtualAllocEx(hProcess, NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	WriteProcessMemory(hProcess, pThreadData, &data, sizeof(data), NULL);
+	DWORD SizeOfCode = (DWORD)injection::stub_ldr - (DWORD)injection::thread_ldr;
+	LPVOID pCode = VirtualAllocEx(hProcess, NULL, SizeOfCode, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	WriteProcessMemory(hProcess, pCode, (PVOID)injection::thread_ldr, SizeOfCode, NULL);
+
+	////////Thread////////////	
+
+	auto status = CreateRemoteThread(hProcess, 0, 0, (LPTHREAD_START_ROUTINE)pCode, pThreadData, 0, 0);
+	if (status == INVALID_HANDLE_VALUE)
+	{		
+		CloseHandle(status);
+		CloseHandle(hProcess);
 		return 0;
 	}
 
-	LPVOID mem = VirtualAllocEx(hProcess, NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-
-	SuspendThread(hThread);
-
-	CONTEXT ctx;
-	ctx.ContextFlags = CONTEXT_FULL;
-	GetThreadContext(hThread, &ctx);
-
-	LPVOID buffer = VirtualAlloc(NULL, 65536, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-
-	LPBYTE ptr;
-	ptr = (LPBYTE)buffer;
-
-	memcpy(buffer, code, sizeof(code));
-
-	
-	while (1)
-	{
-		if (*ptr == 0xb8 && *(PDWORD)(ptr + 1) == 0xCCCCCCCC)
-		{
-			*(PDWORD)(ptr + 1) = (DWORD)LoadLibraryA;
-		}
-		if (*ptr == 0x68 && *(PDWORD)(ptr + 1) == 0xCCCCCCCC)
-		{
-			*(PDWORD)(ptr + 1) = ctx.Eip;
-		}
-		if (*ptr == 0xc3)
-		{
-			ptr++;
-			break;
-		}
-		ptr++;
-	}
-
-	strcpy((char*)ptr, dll_path);
-
-	WriteProcessMemory(hProcess, mem, buffer, sizeof(code) + strlen((char*)ptr), NULL);
-
-	ctx.Eip = (DWORD)mem;
-
-	SetThreadContext(hThread, &ctx);
-
-	ResumeThread(hThread);
-
-	VirtualFree(buffer, 0, MEM_RELEASE);
-
-	CloseHandle(hThread);
+	CloseHandle(status);
 	CloseHandle(hProcess);
 
-	printf("[+] Dll injetada com sucesso: \n");
-
+	printf("[+] Dll injetada com sucesso: %X \n", status);
 	return 1;
+	//auto status = RtlCreateUserThread(hProcess, nullptr, 0, 0, 0, 0, pCode, pThreadData, &out_handle, &cid);
 }
