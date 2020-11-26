@@ -4,19 +4,108 @@
 
 namespace injection
 {
+	void __stdcall shellcode_manual(MANUAL_MAPPING_DATA* pData);
 	DWORD get_thread_id(DWORD PID);
 	HANDLE WINAPI thread_ldr(PTHREAD_DATA data);
 	DWORD WINAPI stub_ldr();
 
-	bool Inject_LoadLibrary_CreateRemoteThread(DWORD PID, const char* dll_path);
-	bool Inject_LoadLibrary_NtCreateThreadEx(DWORD PID, const char* dll_path);
-	bool Inject_LoadLibrary_RtlCreateUserThread(DWORD PID, const char* dll_path);
-	bool Inject_LoadLibrary_ThreadHijackX86(DWORD PID, const char* dll_path);
+	//Usando LoadLibrary para carregar a dll//
+	bool Inject_LoadLibrary_CreateRemoteThread(DWORD PID, const char* dll_path);	//Injetor Padrão LVL 0
+	bool Inject_LoadLibrary_NtCreateThreadEx(DWORD PID, const char* dll_path);		//Injetor LVL 1
+	bool Inject_LoadLibrary_RtlCreateUserThread(DWORD PID, const char* dll_path);	//Injetor LVL 1
+	bool Inject_LoadLibrary_ThreadHijackX86(DWORD PID, const char* dll_path);		//Injetor LVL 2
 
-	bool Inject_LdrLoadDll_NtCreateThreadEx(DWORD PID, const char* dll_path);
-	bool Inject_LdrLoadDll_RtlCreateUserThread(DWORD PID, const char* dll_path);
-	bool Inject_LdrLoadDll_CreateRemoteThread(DWORD PID, const char* dll_path);
+	//Usando LdrLoadDll para carregar a dll//
+	bool Inject_LdrLoadDll_NtCreateThreadEx(DWORD PID, const char* dll_path);		//Injetor LVL 2
+	bool Inject_LdrLoadDll_RtlCreateUserThread(DWORD PID, const char* dll_path);	//Injetor LVL 2
+	bool Inject_LdrLoadDll_CreateRemoteThread(DWORD PID, const char* dll_path);		//Injetor LVL 1
+
+	//Escrevendo a dll na memoria do processo para usala//
+	bool Inject_ManualMap_CreateRemoteThread(DWORD PID, const char* dll_path);		//Broihon original				 LVL 2
+	bool Inject_ManualMap_RtlCreateUserThread(DWORD PID, const char* dll_path);		//Broihon modificado by bieljtvz LVL 3
+	bool Inject_ManualMap_NtCreateThreadEx(DWORD PID, const char* dll_path);		//Broihon modificado by bieljtvz LVL 3
+
 };
+
+
+void __stdcall injection::shellcode_manual(MANUAL_MAPPING_DATA* pData)
+{
+	if (!pData)
+		return;
+
+	BYTE* pBase = reinterpret_cast<BYTE*>(pData);
+	auto* pOpt = &reinterpret_cast<IMAGE_NT_HEADERS*>(pBase + reinterpret_cast<IMAGE_DOS_HEADER*>(pData)->e_lfanew)->OptionalHeader;
+
+	auto _LoadLibraryA = pData->pLoadLibraryA;
+	auto _GetProcAddress = pData->pGetProcAddress;
+	auto _DllMain = reinterpret_cast<f_DLL_ENTRY_POINT>(pBase + pOpt->AddressOfEntryPoint);
+
+	BYTE* LocationDelta = pBase - pOpt->ImageBase;
+	if (LocationDelta)
+	{
+		if (!pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size)
+			return;
+
+		auto* pRelocData = reinterpret_cast<IMAGE_BASE_RELOCATION*>(pBase + pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
+		while (pRelocData->VirtualAddress)
+		{
+			UINT AmountOfEntries = (pRelocData->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+			WORD* pRelativeInfo = reinterpret_cast<WORD*>(pRelocData + 1);
+
+			for (UINT i = 0; i != AmountOfEntries; ++i, ++pRelativeInfo)
+			{
+				if (RELOC_FLAG(*pRelativeInfo))
+				{
+					UINT_PTR* pPatch = reinterpret_cast<UINT_PTR*>(pBase + pRelocData->VirtualAddress + ((*pRelativeInfo) & 0xFFF));
+					*pPatch += reinterpret_cast<UINT_PTR>(LocationDelta);
+				}
+			}
+			pRelocData = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<BYTE*>(pRelocData) + pRelocData->SizeOfBlock);
+		}
+	}
+
+	if (pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size)
+	{
+		auto* pImportDescr = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(pBase + pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+		while (pImportDescr->Name)
+		{
+			char* szMod = reinterpret_cast<char*>(pBase + pImportDescr->Name);
+			HINSTANCE hDll = _LoadLibraryA(szMod);
+
+			ULONG_PTR* pThunkRef = reinterpret_cast<ULONG_PTR*>(pBase + pImportDescr->OriginalFirstThunk);
+			ULONG_PTR* pFuncRef = reinterpret_cast<ULONG_PTR*>(pBase + pImportDescr->FirstThunk);
+
+			if (!pThunkRef)
+				pThunkRef = pFuncRef;
+
+			for (; *pThunkRef; ++pThunkRef, ++pFuncRef)
+			{
+				if (IMAGE_SNAP_BY_ORDINAL(*pThunkRef))
+				{
+					*pFuncRef = _GetProcAddress(hDll, reinterpret_cast<char*>(*pThunkRef & 0xFFFF));
+				}
+				else
+				{
+					auto* pImport = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(pBase + (*pThunkRef));
+					*pFuncRef = _GetProcAddress(hDll, pImport->Name);
+				}
+			}
+			++pImportDescr;
+		}
+	}
+
+	if (pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size)
+	{
+		auto* pTLS = reinterpret_cast<IMAGE_TLS_DIRECTORY*>(pBase + pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
+		auto* pCallback = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(pTLS->AddressOfCallBacks);
+		for (; pCallback && *pCallback; ++pCallback)
+			(*pCallback)(pBase, DLL_PROCESS_ATTACH, nullptr);
+	}
+
+	_DllMain(pBase, DLL_PROCESS_ATTACH, nullptr);
+
+	pData->hMod = reinterpret_cast<HINSTANCE>(pBase);
+}
 
 DWORD injection::get_thread_id(DWORD PID)
 {
@@ -92,14 +181,14 @@ bool injection::Inject_LoadLibrary_NtCreateThreadEx(DWORD PID, const char* dll_p
 	}
 
 	LPVOID LoadLibrary_Addr = (LPVOID)GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryA");
-	LPVOID NtCreateThread_Addr = (LPVOID)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtCreateThreadEx");
+	
 
 	LPVOID Memory = (LPVOID)VirtualAllocEx(hProcess, NULL, strlen(dll_path) + 1, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 
 	WriteProcessMemory(hProcess, (LPVOID)Memory, dll_path, strlen(dll_path) + 1, NULL);
 
 	HANDLE Thread_Handle = INVALID_HANDLE_VALUE;
-
+	LPVOID NtCreateThread_Addr = (LPVOID)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtCreateThreadEx");
 	pfnNtCreateThreadEx NtCreateThreadEx = (pfnNtCreateThreadEx)NtCreateThread_Addr;
 
 	////////////////////////
@@ -451,3 +540,526 @@ bool injection::Inject_LdrLoadDll_CreateRemoteThread(DWORD PID, const char* dll_
 	return 1;
 	//auto status = RtlCreateUserThread(hProcess, nullptr, 0, 0, 0, 0, pCode, pThreadData, &out_handle, &cid);
 }
+
+bool injection::Inject_ManualMap_CreateRemoteThread(DWORD PID, const char* dll_path)
+{
+	BYTE* pSrcData = nullptr;
+	IMAGE_NT_HEADERS* pOldNtHeader = nullptr;
+	IMAGE_OPTIONAL_HEADER* pOldOptHeader = nullptr;
+	IMAGE_FILE_HEADER* pOldFileHeader = nullptr;
+
+	std::ifstream File(dll_path, std::ios::binary | std::ios::ate);
+
+	if (File.fail())
+	{
+		printf("[-] Erro ao abrir DLL: %X\n", (DWORD)File.rdstate());
+		File.close();
+		return false;
+	}
+
+	auto FileSize = File.tellg();
+	if (FileSize < 0x1000)
+	{
+		printf("[-] Tamanho do arquivo invalido: \n");
+		File.close();
+		return false;
+	}
+
+	pSrcData = new BYTE[(UINT_PTR)FileSize];
+	if (!pSrcData)
+	{
+		printf("[-] Falha ao alocar memoria: \n");
+		File.close();
+		return false;
+	}
+
+	File.seekg(0, std::ios::beg);
+	File.read(reinterpret_cast<char*>(pSrcData), FileSize);
+	File.close();	
+
+	if (reinterpret_cast<IMAGE_DOS_HEADER*>(pSrcData)->e_magic != 0x5A4D) //"MZ"
+	{
+		printf("Invalid file\n");
+		delete[] pSrcData;
+		return false;
+	}
+
+	pOldNtHeader = reinterpret_cast<IMAGE_NT_HEADERS*>(pSrcData + reinterpret_cast<IMAGE_DOS_HEADER*>(pSrcData)->e_lfanew);
+	pOldOptHeader = &pOldNtHeader->OptionalHeader;
+	pOldFileHeader = &pOldNtHeader->FileHeader;
+
+#ifdef _WIN64
+	if (pOldFileHeader->Machine != IMAGE_FILE_MACHINE_AMD64)
+	{
+		printf("[-] Plataforma invalida: \n");
+		delete[] pSrcData;
+		return false;
+	}
+#else
+	if (pOldFileHeader->Machine != IMAGE_FILE_MACHINE_I386)
+	{
+		printf("[-] Plataforma invalida: \n");
+		delete[] pSrcData;
+		return false;
+	}
+#endif
+
+	HANDLE hProcess = OpenProcess(GENERIC_ALL, NULL, PID);
+	if (hProcess == INVALID_HANDLE_VALUE)
+	{
+		printf("[-] Falha ao abrir processo: %X\n", GetLastError());
+		CloseHandle(hProcess);
+		return 0;
+	}
+
+	BYTE* pTargetBase = reinterpret_cast<BYTE*>(VirtualAllocEx(hProcess, reinterpret_cast<void*>(pOldOptHeader->ImageBase), pOldOptHeader->SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+	if (!pTargetBase)
+	{
+		pTargetBase = reinterpret_cast<BYTE*>(VirtualAllocEx(hProcess, nullptr, pOldOptHeader->SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+		if (!pTargetBase)
+		{
+			printf("[-] Falha ao allocar memoria: 0x%X\n", GetLastError());
+			delete[] pSrcData;
+			return false;
+		}
+	}
+
+	MANUAL_MAPPING_DATA data{ 0 };
+	data.pLoadLibraryA = LoadLibraryA;
+	data.pGetProcAddress = reinterpret_cast<f_GetProcAddress>(GetProcAddress);
+
+	auto* pSectionHeader = IMAGE_FIRST_SECTION(pOldNtHeader);
+	for (UINT i = 0; i != pOldFileHeader->NumberOfSections; ++i, ++pSectionHeader)
+	{
+		if (pSectionHeader->SizeOfRawData)
+		{
+			if (!WriteProcessMemory(hProcess, pTargetBase + pSectionHeader->VirtualAddress, pSrcData + pSectionHeader->PointerToRawData, pSectionHeader->SizeOfRawData, nullptr))
+			{
+				printf("[-] Impossivel mapear secçao: 0x%x\n", GetLastError());
+				delete[] pSrcData;
+				VirtualFreeEx(hProcess, pTargetBase, 0, MEM_RELEASE);
+				return false;
+			}
+		}
+	}
+
+	memcpy(pSrcData, &data, sizeof(data));
+	WriteProcessMemory(hProcess, pTargetBase, pSrcData, 0x1000, nullptr);
+
+	delete[] pSrcData;
+
+	void* pShellcode = VirtualAllocEx(hProcess, nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	if (!pShellcode)
+	{
+		printf("[-] Falha ao allocar memoria: 0x%X\n", GetLastError());
+		VirtualFreeEx(hProcess, pTargetBase, 0, MEM_RELEASE);
+		return false;
+	}
+
+	WriteProcessMemory(hProcess, pShellcode, injection::shellcode_manual, 0x1000, nullptr);
+
+	HANDLE hThread = CreateRemoteThread(hProcess, nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(pShellcode), pTargetBase, 0, nullptr);
+
+	CloseHandle(hThread);
+
+	HINSTANCE hCheck = NULL;
+	while (!hCheck)
+	{
+		MANUAL_MAPPING_DATA data_checked{ 0 };
+		ReadProcessMemory(hProcess, pTargetBase, &data_checked, sizeof(data_checked), nullptr);
+		hCheck = data_checked.hMod;
+		Sleep(10);
+	}
+
+	VirtualFreeEx(hProcess, pShellcode, 0, MEM_RELEASE);
+
+	printf("[+] Dll injetada com sucesso: \n");
+} 
+
+bool injection::Inject_ManualMap_RtlCreateUserThread(DWORD PID, const char* dll_path)
+{
+	BYTE* pSrcData = nullptr;
+	IMAGE_NT_HEADERS* pOldNtHeader = nullptr;
+	IMAGE_OPTIONAL_HEADER* pOldOptHeader = nullptr;
+	IMAGE_FILE_HEADER* pOldFileHeader = nullptr;
+
+	std::ifstream File(dll_path, std::ios::binary | std::ios::ate);
+
+	if (File.fail())
+	{
+		printf("[-] Erro ao abrir DLL: %X\n", (DWORD)File.rdstate());
+		File.close();
+		return false;
+	}
+
+	auto FileSize = File.tellg();
+	if (FileSize < 0x1000)
+	{
+		printf("[-] Tamanho do arquivo invalido: \n");
+		File.close();
+		return false;
+	}
+
+	pSrcData = new BYTE[(UINT_PTR)FileSize];
+	if (!pSrcData)
+	{
+		printf("[-] Falha ao alocar memoria: \n");
+		File.close();
+		return false;
+	}
+
+	File.seekg(0, std::ios::beg);
+	File.read(reinterpret_cast<char*>(pSrcData), FileSize);
+	File.close();
+
+	if (reinterpret_cast<IMAGE_DOS_HEADER*>(pSrcData)->e_magic != 0x5A4D) //"MZ"
+	{
+		printf("Invalid file\n");
+		delete[] pSrcData;
+		return false;
+	}
+
+	pOldNtHeader = reinterpret_cast<IMAGE_NT_HEADERS*>(pSrcData + reinterpret_cast<IMAGE_DOS_HEADER*>(pSrcData)->e_lfanew);
+	pOldOptHeader = &pOldNtHeader->OptionalHeader;
+	pOldFileHeader = &pOldNtHeader->FileHeader;
+
+#ifdef _WIN64
+	if (pOldFileHeader->Machine != IMAGE_FILE_MACHINE_AMD64)
+	{
+		printf("[-] Plataforma invalida: \n");
+		delete[] pSrcData;
+		return false;
+	}
+#else
+	if (pOldFileHeader->Machine != IMAGE_FILE_MACHINE_I386)
+	{
+		printf("[-] Plataforma invalida: \n");
+		delete[] pSrcData;
+		return false;
+	}
+#endif
+
+	HANDLE hProcess = OpenProcess(GENERIC_ALL, NULL, PID);
+	if (hProcess == INVALID_HANDLE_VALUE)
+	{
+		printf("[-] Falha ao abrir processo: %X\n", GetLastError());
+		CloseHandle(hProcess);
+		return 0;
+	}
+
+	BYTE* pTargetBase = reinterpret_cast<BYTE*>(VirtualAllocEx(hProcess, reinterpret_cast<void*>(pOldOptHeader->ImageBase), pOldOptHeader->SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+	if (!pTargetBase)
+	{
+		pTargetBase = reinterpret_cast<BYTE*>(VirtualAllocEx(hProcess, nullptr, pOldOptHeader->SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+		if (!pTargetBase)
+		{
+			printf("[-] Falha ao allocar memoria: 0x%X\n", GetLastError());
+			delete[] pSrcData;
+			return false;
+		}
+	}
+
+	MANUAL_MAPPING_DATA data{ 0 };
+	data.pLoadLibraryA = LoadLibraryA;
+	data.pGetProcAddress = reinterpret_cast<f_GetProcAddress>(GetProcAddress);
+
+	auto* pSectionHeader = IMAGE_FIRST_SECTION(pOldNtHeader);
+	for (UINT i = 0; i != pOldFileHeader->NumberOfSections; ++i, ++pSectionHeader)
+	{
+		if (pSectionHeader->SizeOfRawData)
+		{
+			if (!WriteProcessMemory(hProcess, pTargetBase + pSectionHeader->VirtualAddress, pSrcData + pSectionHeader->PointerToRawData, pSectionHeader->SizeOfRawData, nullptr))
+			{
+				printf("[-] Impossivel mapear secçao: 0x%x\n", GetLastError());
+				delete[] pSrcData;
+				VirtualFreeEx(hProcess, pTargetBase, 0, MEM_RELEASE);
+				return false;
+			}
+		}
+	}
+
+	memcpy(pSrcData, &data, sizeof(data));
+	WriteProcessMemory(hProcess, pTargetBase, pSrcData, 0x1000, nullptr);
+
+	delete[] pSrcData;
+
+	void* pShellcode = VirtualAllocEx(hProcess, nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	if (!pShellcode)
+	{
+		printf("[-] Falha ao allocar memoria: 0x%X\n", GetLastError());
+		VirtualFreeEx(hProcess, pTargetBase, 0, MEM_RELEASE);
+		return false;
+	}
+
+	WriteProcessMemory(hProcess, pShellcode, injection::shellcode_manual, 0x1000, nullptr);
+
+	//
+	//Thread
+
+	LPVOID RtlCreateUserThread_Addr = (LPVOID)GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlCreateUserThread");
+	pfnRtlCreateUserThread RtlCreateUserThread = (pfnRtlCreateUserThread)RtlCreateUserThread_Addr;
+
+	HANDLE out_handle = INVALID_HANDLE_VALUE;
+	CLIENT_ID cid;
+
+	////////
+
+	auto status = RtlCreateUserThread(hProcess, nullptr, 0, 0, 0, 0, pShellcode, pTargetBase, &out_handle, &cid);
+	if (status != 0)
+	{
+		printf("[-] Erro ao tentar chamar RtlCreateUserThread: %X\n", status);
+		CloseHandle(out_handle);
+		CloseHandle(hProcess);
+		return 0;
+	}
+
+	CloseHandle(out_handle);
+
+	HINSTANCE hCheck = NULL;
+	while (!hCheck)
+	{
+		MANUAL_MAPPING_DATA data_checked{ 0 };
+		ReadProcessMemory(hProcess, pTargetBase, &data_checked, sizeof(data_checked), nullptr);
+		hCheck = data_checked.hMod;
+		Sleep(10);
+	}
+
+	VirtualFreeEx(hProcess, pShellcode, 0, MEM_RELEASE);
+
+	printf("[+] Dll injetada com sucesso: \n");
+}
+
+bool injection::Inject_ManualMap_NtCreateThreadEx(DWORD PID, const char* dll_path)
+{
+	BYTE* pSrcData = nullptr;
+	IMAGE_NT_HEADERS* pOldNtHeader = nullptr;
+	IMAGE_OPTIONAL_HEADER* pOldOptHeader = nullptr;
+	IMAGE_FILE_HEADER* pOldFileHeader = nullptr;
+
+	std::ifstream File(dll_path, std::ios::binary | std::ios::ate);
+
+	if (File.fail())
+	{
+		printf("[-] Erro ao abrir DLL: %X\n", (DWORD)File.rdstate());
+		File.close();
+		return false;
+	}
+
+	auto FileSize = File.tellg();
+	if (FileSize < 0x1000)
+	{
+		printf("[-] Tamanho do arquivo invalido: \n");
+		File.close();
+		return false;
+	}
+
+	pSrcData = new BYTE[(UINT_PTR)FileSize];
+	if (!pSrcData)
+	{
+		printf("[-] Falha ao alocar memoria: \n");
+		File.close();
+		return false;
+	}
+
+	File.seekg(0, std::ios::beg);
+	File.read(reinterpret_cast<char*>(pSrcData), FileSize);
+	File.close();
+
+	if (reinterpret_cast<IMAGE_DOS_HEADER*>(pSrcData)->e_magic != 0x5A4D) //"MZ"
+	{
+		printf("Invalid file\n");
+		delete[] pSrcData;
+		return false;
+	}
+
+	pOldNtHeader = reinterpret_cast<IMAGE_NT_HEADERS*>(pSrcData + reinterpret_cast<IMAGE_DOS_HEADER*>(pSrcData)->e_lfanew);
+	pOldOptHeader = &pOldNtHeader->OptionalHeader;
+	pOldFileHeader = &pOldNtHeader->FileHeader;
+
+#ifdef _WIN64
+	if (pOldFileHeader->Machine != IMAGE_FILE_MACHINE_AMD64)
+	{
+		printf("[-] Plataforma invalida: \n");
+		delete[] pSrcData;
+		return false;
+	}
+#else
+	if (pOldFileHeader->Machine != IMAGE_FILE_MACHINE_I386)
+	{
+		printf("[-] Plataforma invalida: \n");
+		delete[] pSrcData;
+		return false;
+	}
+#endif
+
+	HANDLE hProcess = OpenProcess(GENERIC_ALL, NULL, PID);
+	if (hProcess == INVALID_HANDLE_VALUE)
+	{
+		printf("[-] Falha ao abrir processo: %X\n", GetLastError());
+		CloseHandle(hProcess);
+		return 0;
+	}
+
+	BYTE* pTargetBase = reinterpret_cast<BYTE*>(VirtualAllocEx(hProcess, reinterpret_cast<void*>(pOldOptHeader->ImageBase), pOldOptHeader->SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+	if (!pTargetBase)
+	{
+		pTargetBase = reinterpret_cast<BYTE*>(VirtualAllocEx(hProcess, nullptr, pOldOptHeader->SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+		if (!pTargetBase)
+		{
+			printf("[-] Falha ao allocar memoria: 0x%X\n", GetLastError());
+			delete[] pSrcData;
+			return false;
+		}
+	}
+
+	MANUAL_MAPPING_DATA data{ 0 };
+	data.pLoadLibraryA = LoadLibraryA;
+	data.pGetProcAddress = reinterpret_cast<f_GetProcAddress>(GetProcAddress);
+
+	auto* pSectionHeader = IMAGE_FIRST_SECTION(pOldNtHeader);
+	for (UINT i = 0; i != pOldFileHeader->NumberOfSections; ++i, ++pSectionHeader)
+	{
+		if (pSectionHeader->SizeOfRawData)
+		{
+			if (!WriteProcessMemory(hProcess, pTargetBase + pSectionHeader->VirtualAddress, pSrcData + pSectionHeader->PointerToRawData, pSectionHeader->SizeOfRawData, nullptr))
+			{
+				printf("[-] Impossivel mapear secçao: 0x%x\n", GetLastError());
+				delete[] pSrcData;
+				VirtualFreeEx(hProcess, pTargetBase, 0, MEM_RELEASE);
+				return false;
+			}
+		}
+	}
+
+	memcpy(pSrcData, &data, sizeof(data));
+	WriteProcessMemory(hProcess, pTargetBase, pSrcData, 0x1000, nullptr);
+
+	delete[] pSrcData;
+
+	void* pShellcode = VirtualAllocEx(hProcess, nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	if (!pShellcode)
+	{
+		printf("[-] Falha ao allocar memoria: 0x%X\n", GetLastError());
+		VirtualFreeEx(hProcess, pTargetBase, 0, MEM_RELEASE);
+		return false;
+	}
+
+	WriteProcessMemory(hProcess, pShellcode, injection::shellcode_manual, 0x1000, nullptr);
+
+
+
+	///////////Thread////////////////////////
+	LPVOID NtCreateThread_Addr = (LPVOID)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtCreateThreadEx");
+
+	pfnNtCreateThreadEx NtCreateThreadEx = (pfnNtCreateThreadEx)NtCreateThread_Addr;	
+
+	NtCreateThreadExBuffer ntbuffer;
+
+	memset(&ntbuffer, 0, sizeof(NtCreateThreadExBuffer));
+	ULONG temp0[2];
+	ULONG temp1;
+
+	ntbuffer.Size = sizeof(NtCreateThreadExBuffer);
+	ntbuffer.Unknown1 = 0x10003;
+	ntbuffer.Unknown2 = sizeof(temp0);
+	ntbuffer.Unknown3 = temp0;
+	ntbuffer.Unknown4 = NULL;
+	ntbuffer.Unknown5 = 0x10004;
+	ntbuffer.Unknown6 = sizeof(temp1);
+	ntbuffer.Unknown7 = &temp1;
+	ntbuffer.Unknown8 = NULL;
+
+	HANDLE Thread_Handle = INVALID_HANDLE_VALUE;
+
+	/////////////////////////
+	auto status = NtCreateThreadEx(&Thread_Handle, GENERIC_ALL, nullptr, hProcess, (LPTHREAD_START_ROUTINE)pShellcode, pTargetBase, NULL, 0, 0, 0, &ntbuffer);
+	if (status != 0)
+	{
+		printf("[-] Erro ao tentar chamar NtCreateThreadEx: %X", status);
+		CloseHandle(Thread_Handle);
+		CloseHandle(hProcess);
+		return 0;
+	}
+
+
+	//HANDLE hThread = CreateRemoteThread(hProcess, nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(pShellcode), pTargetBase, 0, nullptr);
+
+	CloseHandle(Thread_Handle);
+
+	HINSTANCE hCheck = NULL;
+	while (!hCheck)
+	{
+		MANUAL_MAPPING_DATA data_checked{ 0 };
+		ReadProcessMemory(hProcess, pTargetBase, &data_checked, sizeof(data_checked), nullptr);
+		hCheck = data_checked.hMod;
+		Sleep(10);
+	}
+
+	VirtualFreeEx(hProcess, pShellcode, 0, MEM_RELEASE);
+
+	printf("[+] Dll injetada com sucesso: \n");
+}
+
+//bool SetWindowHook(DWORD PID, const char* dll_path)
+//{
+//	HWND hwnd = FindWindow(NULL, L"RaidCall");
+//	if (hwnd == NULL) {
+//		cout << "[ FAILED ] Could not find target window." << endl;
+//		system("pause");
+//		return EXIT_FAILURE;
+//	}
+//
+//	// Getting the thread of the window and the PID
+//	DWORD pid = NULL;
+//	DWORD tid = GetWindowThreadProcessId(hwnd, &pid);
+//	if (tid == NULL) {
+//		cout << "[ FAILED ] Could not get thread ID of the target window." << endl;
+//		system("pause");
+//		return EXIT_FAILURE;
+//	}
+//
+//	// Loading DLL
+//	HMODULE dll = LoadLibraryEx(L"C:\\Users\\ELB\\source\\repos\\MessageBox_Dll\\Debug\\MessageBox_Dll.dll", NULL, DONT_RESOLVE_DLL_REFERENCES);
+//	if (dll == NULL) {
+//		cout << "[ FAILED ] The DLL could not be found." << endl;
+//		system("pause");
+//		return EXIT_FAILURE;
+//	}
+//
+//	// Getting exported function address
+//	HOOKPROC addr = (HOOKPROC)GetProcAddress(dll, "NextHook");
+//	if (addr == NULL) {
+//		cout << "[ FAILED ] The function was not found." << endl;
+//		system("pause");
+//		return EXIT_FAILURE;
+//	}
+//
+//	// Setting the hook in the hook chain
+//	HHOOK handle = SetWindowsHookEx(WH_GETMESSAGE, addr, dll, tid); // Or WH_KEYBOARD if you prefer to trigger the hook manually
+//	if (handle == NULL) {
+//		cout << "[ FAILED ] Couldn't set the hook with SetWindowsHookEx." << endl;
+//		system("pause");
+//		return EXIT_FAILURE;
+//	}
+//
+//	// Triggering the hook
+//	PostThreadMessage(tid, WM_NULL, NULL, NULL);
+//
+//	// Waiting for user input to remove the hook
+//	cout << "[ OK ] Hook set and triggered." << endl;
+//	cout << "[ >> ] Press any key to unhook (This will unload the DLL)." << endl;
+//	system("pause > nul");
+//
+//	// Unhooking
+//	BOOL unhook = UnhookWindowsHookEx(handle);
+//	if (unhook == FALSE) {
+//		cout << "[ FAILED ] Could not remove the hook." << endl;
+//		system("pause");
+//		return EXIT_FAILURE;
+//	}
+//
+//	cout << "[ OK ] Done. Press any key to exit." << endl;
+//	system("pause > nul");
+//	return EXIT_SUCCESS;
+//}
+
